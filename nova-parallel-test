@@ -1,0 +1,193 @@
+#!/usr/bin/python
+
+import datetime
+from pprint import pprint
+import os
+import sys
+import threading
+import time
+
+from novaclient.v1_1.client import Client
+
+def main():
+    worker_count, lister_count = parse_args_or_die()
+    lister_clients = init_clients(lister_count)
+    lister_threads = list_sequentially_forever(lister_clients)
+    clients = init_clients(worker_count)
+    list_sequentially_forever(lister_clients)
+    servers, times, overall_time = create_servers(clients)
+    display('Creates', times, overall_time)
+    for thread in lister_threads:
+        thread.stop()
+    wait_on_servers(servers)
+    clients[0].servers.list()
+    times, overall_time = delete_servers(servers)
+    display('Deletes', times, overall_time)
+
+def display(label, times, overall_time):
+    print '--------- %s --------' % label
+    print '  Overall time: %s' % overall_time
+    for uuid, time in times.items():
+        print "    %s: %s" % (uuid, time)
+
+
+def parse_args_or_die():
+    if len(sys.argv) > 2:
+        return int(sys.argv[1]), int(sys.argv[2])
+    else:
+        return 1, 0
+
+
+def init_clients(count):
+    username = os.environ['OS_AUTH_USER']
+    api_key = os.environ['OS_AUTH_KEY']
+    project_id = os.environ['OS_AUTH_TENANT']
+    auth_url = os.environ['OS_AUTH_URL']
+    clients = []
+    for i in xrange(count):
+        client = Client(username, api_key, project_id, auth_url)
+        client.authenticate()
+        clients.append(client)
+    return clients
+
+
+def list_sequentially_forever(clients):
+    threads = [ListServersThread(client) for client in clients]
+    for thread in threads:
+        thread.daemon = True
+        thread.start()
+    return threads
+
+
+class ListServersThread(threading.Thread):
+
+    def __init__(self, client):
+        super(ListServersThread, self).__init__()
+        self.client = client
+        self._stop = False
+
+    def run(self):
+        while not self._stop:
+            servers = self.client.servers.list()
+
+    def stop(self):
+        self._stop = True
+
+
+def create_servers(clients):
+    image = clients[0].images.find()
+    flavor = clients[0].flavors.find(ram=2048)
+    start_condition = threading.Condition()
+    threads = [CreateServerThread(client, start_condition, image, flavor)
+               for client in clients]
+    for thread in threads:
+        thread.start()
+    time.sleep(0.1)
+    timer = Timer()
+    with timer:
+        start_condition.acquire()
+        start_condition.notify_all()
+        start_condition.release()
+        for thread in threads:
+            thread.join()
+    times = {}
+    servers = []
+    for thread in threads:
+        times[thread.server.id] = thread.timer.time
+        servers.append(thread.server)
+    return servers, times, timer.time
+
+
+class CreateServerThread(threading.Thread):
+
+    def __init__(self, client, start_condition, image, flavor):
+        self.client = client
+        self.start_condition = start_condition
+        self.image = image
+        self.flavor = flavor
+        self.server = None
+        self.timer = Timer()
+        super(CreateServerThread, self).__init__()
+
+    def run(self):
+        self.start_condition.acquire()
+        self.start_condition.wait()
+        self.start_condition.release()
+        with self.timer:
+            server = self.client.servers.create('test', self.image,
+                                                self.flavor)
+        self.server = server
+
+
+def wait_on_servers(servers):
+    while True:
+        all_active = True
+        for server in servers:
+            if server.status == 'ACTIVE':
+                continue
+            server.get()
+            all_active = False
+        if all_active:
+            break
+        time.sleep(5)
+
+
+def delete_servers(servers):
+    start_condition = threading.Condition()
+    threads = [DeleteServerThread(server, start_condition)
+               for server in servers]
+    for thread in threads:
+        thread.start()
+    time.sleep(0.1)
+    timer = Timer()
+    with timer:
+        start_condition.acquire()
+        start_condition.notify_all()
+        start_condition.release()
+        for thread in threads:
+            thread.join()
+    times = {}
+    for thread in threads:
+        times[thread.server.id] = thread.timer.time
+    return times, timer.time
+
+
+class DeleteServerThread(threading.Thread):
+
+    def __init__(self, server, start_condition):
+        self.server = server
+        self.start_condition = start_condition
+        self.timer = Timer()
+        super(DeleteServerThread, self).__init__()
+
+    def run(self):
+        self.start_condition.acquire()
+        self.start_condition.wait()
+        self.start_condition.release()
+        with self.timer:
+            self.server.delete()
+
+
+class Timer(object):
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self._start = None
+        self._finish = None
+
+    @property
+    def time(self):
+        return self._finish - self._start
+
+    def __enter__(self):
+        self._start = datetime.datetime.now()
+
+    def __exit__(self, *args, **kwargs):
+        self._finish = datetime.datetime.now()
+
+
+if __name__ == '__main__':
+    main()
+
